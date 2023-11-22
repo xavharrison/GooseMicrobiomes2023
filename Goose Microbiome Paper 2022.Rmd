@@ -1,0 +1,1996 @@
+---
+title: "Goose Microbiome Paper Dec22"
+author: "Izzie Jones, Kirsty Marsh & Xav Harrison"
+date: '2022-12-02'
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    number_sections: yes
+    theme: united
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Raw Data and Libraries
+
+## Libraries and Plotting Options
+```{r message=FALSE, warning=FALSE}
+
+########### Libraries
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(RColorBrewer)
+library(cowplot)
+library(tidyverse)
+library(microbiome)
+library(BiocManager)
+#library(tidytable)
+#library(plyr)
+#library(dplyr)
+#library(reshape2)
+library(ggordiplots)
+library(brms)
+library(tidybayes)
+library(iNEXT)
+library(igraph)
+library(ggraph)
+library(decontam)
+library(lme4)
+
+
+#Global Plot Options
+plotopts <- theme(axis.text=element_text(size=12),axis.title=element_text(size=16),
+  strip.text=element_text(size=20),legend.title = element_text(size=18),
+  legend.text = element_text(size=18)) 
+
+
+### Custom Plotting Colours for Foraging Phenotypes 
+#Order is M, T, S
+forage_cols <- c(brewer.pal(8,"Set2")[c(1,3,6)])
+forage_cols#"#66C2A5" "#8DA0CB" "#FFD92F"
+```
+
+## Behavioral Data
+
+```{r}
+
+# All Behavioural Data from Field Season 
+mayresight <- read.csv('Resightings_Alftanes_May17.csv',header=T)
+#mayresight <- read.csv(file.choose())
+head(mayresight)
+
+```
+
+## Microbiome Data
+
+```{r}
+
+#Taxonomy
+  tax1 <- as.matrix(read.table("Goose Tax Table.txt",header=T,row.names=1))
+#tax1 <- as.matrix(read.table(file.choose(),header=T,row.names=1))
+  #rownames(tax1)<-paste0("SV",seq(nrow(tax1)))
+  head(tax1)
+
+#Sample Metadata
+  sample1 <- read.table("Goose Metadata.txt",header=T,row.names=1)
+  head(sample1)
+  #sample1 <- read.table(file.choose(),header = T, row.names = 1)
+
+#Sequence Abundances
+  otu1 <- as.matrix(read.table("Goose Abundance Table.txt",header=T,row.names=1))
+  otu1[1:10,1:10]
+#otu1 <- as.matrix(read.table(file.choose(), header=T,row.names = 1))
+#Inspect Column Names - Important these Match For Metadata Joining 
+  head(data.frame(colnames(otu1),sample1[,1]))
+
+  colnames(otu1)<-sample1[,1]
+
+
+###############
+# Metadata Subsetting
+###############
+
+#Read in Metadata  
+  goose <- read.csv('Brent Goose Metagenomics Metadata.csv',header=T)
+  head(goose)
+  #goose <- read.csv(file.choose(), header = T)
+
+#Edit sample ID to get rid of leading zeroes and 'G' indentifier  
+    sampledata <- as.character(sample1$Sample)
+    sample1$sample<-gsub("^G","",gsub("^G0","",gsub("^G00","",sampledata)))
+    goose$sample<-as.character(goose$sample)
+
+#Add Metadata
+  sample1_joined<-left_join(sample1,goose,"sample")
+  head(sample1_joined)
+#Wouldn't work before, so check for duplicates  
+  which(duplicated(sample1_joined$Sample))
+
+#We still need the samples here to match the ASV table, 
+#so we remove one of the duplicates now so we can make the phyloseq object  
+  sample1_joined_nodupplicate<- as.data.frame(sample1_joined[-which(duplicated(sample1_joined$Sample)),])
+
+#Add Rownames = Sample Names to Allow Phyloseq to Cross Reference to ASV and Tax table
+  rownames(sample1_joined_nodupplicate)<-sample1_joined_nodupplicate$Sample
+```
+
+## Combine Into Phyloseq Object
+
+```{r}
+
+ps <- phyloseq(otu_table(otu1,taxa_are_rows = TRUE), 
+               sample_data(sample1_joined_nodupplicate), 
+               tax_table((tax1)))
+
+ps
+
+#Name Columns in Taxonomy 
+colnames(tax_table(ps))<-c("Kingdom","Phylum","Class","Order","Family","Genus")
+head(tax_table(ps))
+
+```
+
+## Microbiome Data Cleaning & Decontamination 
+
+```{r}
+
+###### Strip Out Unwanted SVs like Chloroplasts (lots of plant material in the faeces)
+
+#Identify Which Taxa are Chloroplasts
+    notchloro<-as.logical(tax_table(ps)[,3]!="Chloroplast" & tax_table(ps)[,1]=="Bacteria" & tax_table(ps)[,5]!="Mitochondria")
+#Subset them out 
+    brent<-prune_taxa(notchloro,ps)
+
+#How Many Microbial Taxa Did we Lose?  
+    ntaxa(ps)- ntaxa(brent) 
+
+####### REMOVE NEGATIVE CONTAMINANTS
+# ~This is new code that will be updated in the training guide, using the R package 'decontam'
+#    if (!require("BiocManager", quietly = TRUE))
+#    install.packages("BiocManager")
+# BiocManager::install("decontam")
+library(decontam)
+
+#Indicator for Negative Samples
+sample_data(brent)$is.neg <- ifelse(grepl("negative",sample_data(brent)$sampletype),TRUE,FALSE)
+
+#Identify Contaminants Based on Prevalence in Negative vs 'Real' samples
+#Requires that we tell it which samples are negs, hence code above
+  contamdf.prev <- isContaminant(brent, method="prevalence", neg="is.neg",threshold=0.5)
+
+#How Many Were Identified?    
+  table(contamdf.prev$contaminant) # 
+
+### Use a Stricter Threshold for Identification - will identify more contaminants       
+  contamdf.prev_0.5 <- isContaminant(brent, method="prevalence", neg="is.neg",threshold=0.5)
+  table(contamdf.prev_0.5$contaminant) #
+
+###### Plot of Contaminant Frequency 
+
+# Make phyloseq object of presence-absence in negative controls and true samples
+    ps.pa <- transform_sample_counts(brent, function(abund) 1*(abund>0))
+    ps.pa.neg <- prune_samples(sample_data(ps.pa)$is.neg == TRUE, ps.pa)
+    ps.pa.pos <- prune_samples(sample_data(ps.pa)$is.neg == FALSE, ps.pa)
+
+# Make data.frame of prevalence in positive and negative samples
+#We'll use the stricter thresholds here
+    df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg),
+                    contaminant=contamdf.prev_0.5$contaminant)
+
+##Plot 
+  ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() +
+    xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+
+###### Clean Contaminants Out
+  brent_clean <- prune_taxa(contamdf.prev_0.5$contaminant==FALSE,brent)
+  ntaxa(brent) - ntaxa(brent_clean) #
+  
+
+######## REMOVE MOCK COMMUNITIES AND NEGATIVE and DNA-source samples
+  brent_clean2<-prune_samples(sample_data(brent_clean)$sampletype %in% c("swab","faeces"),brent_clean)
+  brent_clean2 #153 samples
+  
+  range(sample_sums(brent_clean2)) 
+
+#Histogram of Sample Sums  
+  hist(sample_sums(brent_clean2))
+
+#Number falling below key read thresholds (= samples we would lose if we rarefied
+#above that number)  
+  length(which(sample_sums(brent_clean2)<10000)) #
+  
+  length(which(sample_sums(brent_clean2)<5000)) #
+  
+  length(which(sample_sums(brent_clean2)<2000)) #
+
+#Strip Out Swabs 
+  brent_clean2_faecal<-prune_samples(sample_data(brent_clean2)$sampletype=="faeces",brent_clean2)
+
+
+```
+
+# BEHAVIOURAL CLASSIFICATION OF FORAGING PHENOTPYE
+
+```{r}
+####2.1 Proportion of Marine vs Terrestrial####
+
+#Sort Dates Out
+  mayresight_date <- strptime(mayresight$Date,format="%d/%m/%Y")
+  mayresight_date
+
+#Benchmark Day of Year = 15th May 
+  may15 <- strptime("15/05/2017",format="%d/%m/%Y")$yday
+  may15
+
+#Day of Season Relative to 15th May (means API models will estimate intercept = API on 15th May)
+    mayresight$day_of_season <- mayresight_date$yday - may15
+    mayresight$yday <- mayresight_date$yday 
+    summary(mayresight)
+
+#Table of Observations by Bird 
+    birdtab <- table(mayresight$Bird)
+    length(which(birdtab>5))
+
+    nrow(mayresight) #Number of rows in mayresight
+
+    range(table(mayresight$Bird)) # between 1-17 observations
+
+#Birds with 5 or more measurements 
+    bird5 <- names(birdtab)[birdtab>=5]
+    length(bird5)
+
+## Filter to Only Those Birds
+    mayresight5<- mayresight %>% filter(Bird %in% bird5)
+    head(mayresight5)
+    table(mayresight5$Bird)
+
+##### DATA SUMMARY 
+
+may_habitat<- mayresight5 %>% group_by(Bird)  %>% dplyr::summarize(nobs=n(),
+                   #Total Obs for Whole Period  
+                       n_terr_total=sum(grepl("R|N",SiteCode)),
+                       n_mar_total=sum(grepl("G",SiteCode)),
+                       prop_mar_total=n_mar_total/nobs,
+                   #Those Occurring in The FIrst Half of May
+                       n_terr_firsthalf=sum(grepl("R|N",SiteCode[yday<may15])),
+                       n_mar_firsthalf=sum(grepl("G",SiteCode[yday<may15])),
+                       prop_mar_firsthalf=n_mar_firsthalf/(n_terr_firsthalf+n_mar_firsthalf),
+                    #Those Occuring in the Last Half of May 
+                       n_terr_lasthalf=sum(grepl("R|N",SiteCode[yday>=may15])),
+                       n_mar_lasthalf=sum(grepl("G",SiteCode[yday>=may15])),
+                       prop_mar_lasthalf=n_mar_lasthalf/ (n_terr_lasthalf+n_mar_lasthalf)
+      ) #summarize end 
+
+
+  
+  
+## Stitch Data Back on To API Dataframe
+    mayresight5_join <- left_join(mayresight5,may_habitat,"Bird")
+    head(mayresight5_join)
+
+## Classify Foraging 
+    mayresight5_join$foraging_phenotype<-with(mayresight5_join,ifelse(prop_mar_total==1,
+                   "Marine",ifelse(prop_mar_total==0,"Terrestrial","Switcher")))
+
+#Add Foraging to phyloseq
+    meta <- as(sample_data(brent_clean2_faecal), 'data.frame')
+  #Foraging Classification  
+    meta$foraging_phenotype<-mayresight5_join$foraging_phenotype[match(meta$id,mayresight5_join$Bird)]
+  #Proportion Marine  
+    meta$proportion_marine_total<-mayresight5_join$prop_mar_total[match(meta$id,mayresight5_join$Bird)]
+
+  #Remake Phyloseq  
+    brent_clean2_faecal <- phyloseq(otu_table(otu_table(brent_clean2_faecal)), tax_table(tax_table(brent_clean2_faecal)), 
+                    sample_data(meta))
+
+##### Filter
+      brent_clean_faecal_forage <- prune_samples(!is.na(sample_data(brent_clean2_faecal)$foraging_phenotype),brent_clean2_faecal)#remove samples with missing foraging pheno
+      brent_clean_faecal_forage <- prune_taxa(taxa_sums(brent_clean_faecal_forage) > 0, brent_clean_faecal_forage)#remove taxa only found in those samples just removed
+       brent_clean_faecal_forage #3306 ASVs
+      
+      brent_clean_faecal_forage_pa <- transform_sample_counts(brent_clean_faecal_forage,function(x) 1*(x>0)) #convert counts to 0/1
+
+```
+
+# iNEXT, Rarefaction and Sample Coverage
+
+```{r}
+
+taxa_are_rows(brent_clean2_faecal) #check if samples are columns and species are rows (format required for iNEXT)
+otu_tab <- as.data.frame(otu_table(brent_clean2_faecal))#extract otu table from phyloseq object
+
+#otu_tab <- as.data.frame(t(otu_tab)) #change orientation of otu table if needed
+
+```
+
+## Calculate diversity estimates
+
+```{r}
+
+out0 <- iNEXT(otu_tab, q=0, datatype="abundance") 
+#saveRDS(out0, 'Goose_microbiome_iNEXT_output.rds')
+#out0 <- readRDS(file.choose())
+head(out0$AsyEst)
+inext_est <- as.data.frame(out0$AsyEst)
+
+## Rarefaction curve    
+ggiNEXT(out0, type=1,grey=T) +
+  xlim(0,10000) +
+  labs(x="N reads", y="ASV richness") + theme(legend.position = "none")
+
+## Sample Coverage curve 
+ggiNEXT(out0, type=2,grey=T) + xlim(0,7000) +
+  labs(x="N reads") + theme(legend.position = "none")
+
+#Specify the cut-off:
+length(which(sample_sums(brent_clean2_faecal)< 5000)) #Check how many samples would be lost using a given cutoff
+cutoff<- 5000 #specify chosen cutoff
+
+#Create a new phyloseq object, removing samples with read depths below this threshold
+brent_samp_filt <- prune_samples(sample_sums(brent_clean2_faecal)>= cutoff, brent_clean2_faecal) #create a new phyloseq obhect
+#nsamples(brent_samp_filt) #how many samples lost?
+summary(as.factor(sample_data(brent_samp_filt)$foraging_phenotype))
+summary(taxa_sums(brent_samp_filt))
+meta <- as(sample_data(brent_samp_filt), 'data.frame')
+
+#resampling info
+#how many birds resighted 5 or more times?
+ length(bird5)#92 birds
+#how many birds with multiple poo samples?
+names(sample_data(brent_samp_filt))
+brent_samp_filt #123 samples total
+
+poo_resamp <- summary(as.factor(sample_data(brent_samp_filt)$id))
+summary(poo_resamp)
+
+```
+
+
+#  Alpha Diversity Analyses
+
+```{r}
+
+#1. use asymptotic estimates from inext
+  inext_est
+  
+  inext_est2 <- inext_est[,c(1,2,4,5)] #simplify the diversity estimates table, keeping only 4 columns: sample, diversity, estimator and s.e. 
+  inext_est2 <- reshape2::melt(inext_est2, id=c("Assemblage", "Diversity")) #format so that estimator and s.e. values combine into one column for the next step
+  inext_est2 <- reshape2::dcast(inext_est2, Assemblage ~ Diversity + variable, value.var = "value") #convert to wide format so that we have one row per sample (Site), with 
+
+#Separate columns per diversity measure estimate/s.e values.
+  names(inext_est2)[names(inext_est2)=="Assemblage"] <- "Sample" #change sample ID column name
+  head(inext_est2)
+ 
+
+#Tack on Sample Metadata
+  brent_clean_inext <- left_join(inext_est2, meta, "Sample")
+
+#Filter 
+    brent_clean_inext_forage <- subset(brent_clean_inext,!is.na(foraging_phenotype) & site!="")
+#Factor
+    brent_clean_inext_forage$foraging_phenotype<-factor(brent_clean_inext_forage$foraging_phenotype)
+#Clean Variable Names
+    names(brent_clean_inext_forage)[names(brent_clean_inext_forage)=="Species richness_Estimator"] <- "Richness" 
+    names(brent_clean_inext_forage)[names(brent_clean_inext_forage)=="Shannon diversity_Estimator"] <- "Shannon" 
+    
+##Replot
+ggplot(brent_clean_inext_forage,aes(x=foraging_phenotype,y=Richness)) + geom_violin(aes(fill=foraging_phenotype)) + plotopts + labs(x = "Foraging Phenotype", y = "Species Richness")
+
+```
+
+### Plot by Individual iNEXT
+```{r}
+
+##plot by time per individual
+  brent_clean_inext_forage$date <- as.Date(brent_clean_inext_forage$date, format = "%d/%m/%Y")
+  brent_clean_inext_forage$yday <- format(brent_clean_inext_forage$date, "%j")
+#remove geese with only 1 sample
+  sample_sum<-as.data.frame(summary(as.factor(brent_clean_inext_forage$id)))
+  names(sample_sum) <- "n_samp"
+  remove_ids <- rownames(subset(sample_sum, n_samp==1))
+  summary(brent_clean_inext_forage$yday)
+  brent_clean_inext_forage$yday <- as.numeric(brent_clean_inext_forage$yday)
+
+#combine specialists/switchers into facets
+  brent_clean_inext_forage$diet_behav <- NA
+  brent_clean_inext_forage[which(brent_clean_inext_forage$foraging_phenotype%in%c("Marine", "Terrestrial")),]$diet_behav <- "Specialist"
+  brent_clean_inext_forage[which(brent_clean_inext_forage$foraging_phenotype%in%c("Switcher")),]$diet_behav <- "Switcher"
+  summary(as.factor(brent_clean_inext_forage$diet_behav))#
+
+     #reorder foraging phrno category the make it go; T,S,M
+    brent_clean_inext_forage$foraging_phenotype <- factor(brent_clean_inext_forage$foraging_phenotype, levels = c("Terrestrial","Switcher","Marine"))
+    
+alpha_time_inext_plot2 <-
+  ggplot(subset(brent_clean_inext_forage, !id%in%remove_ids), 
+         aes(x=yday, y=Richness, fill=habitat, group=id)) +
+  geom_line(col="grey",linewidth=1) + geom_point(shape=21, size=6,color="white") +
+  facet_grid(~foraging_phenotype) +
+  theme_bw() +
+  theme(axis.title = element_text(size=20),
+        axis.text = element_text(size=16),
+        strip.text = element_text(size=18),
+        legend.text = element_text(size=16),
+        legend.title = element_text(size=20)) +
+  scale_fill_manual(values=c("#8DA0CB","#66C2A5")) +
+  labs(x="Day of the year",y="Richness",fill="Foraging \n Habitat") + theme(legend.position = "right")
+alpha_time_inext_plot2
+
+#SAVE
+#ggsave2('ALpha Diversity Individual time series plot.pdf',alpha_time_inext_plot2,width=15,height=10)
+```
+
+## Model of iNext Richness 
+
+```{r}
+#Standardise day
+  brent_clean_inext_forage<-brent_clean_inext_forage %>% mutate(z_yday=as.numeric(scale(yday)))
+
+#MODEL
+  alpha3<-brm(Richness ~ foraging_phenotype * z_yday + (1|id),data=brent_clean_inext_forage,family=negbinomial())
+    summary(alpha3)
+    conditional_effects(alpha3)
+
+  #Model Checking
+    pp_check(alpha3)
+    bayes_R2(alpha3)
+    
+    #change reference category and re-run model to get terrestrial vs switcher estimates
+#    brent_clean_inext_forage$foraging_phenotype <- relevel(brent_clean_inext_forage$foraging_phenotype,ref="Switcher")
+
+
+#####4.2 Plot of Alpha Diversity Raw Data and Model Predictions####
+
+#Extract MCMC Draws
+  alpha3_coef <- fixef(alpha3,summary=FALSE)
+  head(alpha3_coef)
+#Rename Columns
+  colnames(alpha3_coef)[1:3] <- c("Terrestrial","Switcher","Marine")
+  
+#Convert to Means
+  alpha3_coef[,2:3] <- alpha3_coef[,2:3]+alpha3_coef[,1]
+  
+#BackTransform   
+  alpha3_coef_exp<-exp(alpha3_coef)
+  head(alpha3_coef_exp)
+  
+##Reshape for Plotting
+  library(tidyr)
+  alpha3_coef_exp %>% data.frame() %>% select(Marine,Terrestrial,Switcher)%>% pivot_longer(colnames(alpha3_coef_exp)[1:3],names_to="Foraging",values_to="value") -> alpha3_coef_plotdata
+  head(alpha3_coef_plotdata)
+    
+ 
+    
+#forage_cols
+######## PLOT LAYER 1 - Raw Data
+  alpha1_raw<-ggplot() + geom_point(data=brent_clean_inext_forage,aes(y=Richness,x=foraging_phenotype,fill=foraging_phenotype),shape=21,size=3) +
+    scale_x_discrete(limits = c("Terrestrial", "Switcher", "Marine")) +
+    scale_fill_manual(values=forage_cols) + theme_bw()
+
+######## PLOT LAYER 2 - MODEL ESTIMATES DATA
+    alpha3_plot1 <-  alpha1_raw +   tidybayes::stat_halfeye(data=alpha3_coef_plotdata,aes(x=Foraging,y=value,fill=Foraging),shape=21,point_fill="white",point_size=5,colour="black",slab_alpha=0.5, linewidth=6) + theme_bw()
+    alpha3_plot2 <- alpha3_plot1 + plotopts + labs(y="Alpha Diversity (Richness)",x="Foraging Phenotype") + guides(fill="none")
+    
+    alpha3_plot3 <- alpha3_plot2+ scale_fill_manual(values=c("#66C2A5","#FFD92F","#8DA0CB"))
+    alpha3_plot3 
+
+ #forage_cols #"#66C2A5" "#8DA0CB" "#FFD92F"
+ 
+
+##### SAVE
+# ggsave2('ALpha Diversity Raw Data and Model Means.pdf',alpha3_plot3,width=10,height=10)
+# ggsave2('ALpha Diversity Raw Data and Model Means.jpeg',alpha3_plot3,width=10,height=10)
+  
+```
+###Estimate group differences in richness by subsampling
+
+#### 4.3 Alpha diversity estimates with bootstrapped data
+ #Re-calculate the richness estimates per sample, taking mean and CI per foraging phenotype of random subsample of 17 per group over 1000 iterations
+```{r}
+
+head(brent_clean_inext_forage)
+summary(brent_clean_inext_forage$foraging_phenotype)
+pheno_sum <- brent_clean_inext_forage %>% group_by(id) %>% sample_n(1) %>% summarise(foraging_phenotype)
+summary(pheno_sum$foraging_phenotype)#T=20, S=15, M=6
+
+```
+
+Run the loop (smallest group size =6 for marine)
+```{r}
+
+#create df to store results
+subsample_iteration_dat <- data.frame(Iteration = NA, 
+                                       Marine = NA, 
+                                       Terrestrial = NA,
+                                       Switcher = NA)
+nrep <- 1000
+
+for(i in 1:nrep) {
+  #select random samples for each foraging type
+sample_sub <- brent_clean_inext_forage %>% 
+                              group_by(id) %>% sample_n(1) %>%
+                              group_by(foraging_phenotype) %>% 
+                              sample_n(6)
+marine.mean = mean(subset(sample_sub, foraging_phenotype=="Marine")$Richness)
+terr.mean = mean(subset(sample_sub, foraging_phenotype=="Terrestrial")$Richness)
+swt.mean = mean(subset(sample_sub, foraging_phenotype=="Switcher")$Richness)
+#store results in df
+subsample_iteration_dat[i, 1] <- i
+subsample_iteration_dat[i, 2] <- marine.mean
+subsample_iteration_dat[i, 3] <- terr.mean
+subsample_iteration_dat[i, 4] <- swt.mean
+
+}
+
+head(subsample_iteration_dat)
+
+```
+
+Reshape for plotting distribution
+
+```{r}
+library(reshape2)
+library(plyr)
+rich_dat <- melt(subsample_iteration_dat[2:4])
+colnames(rich_dat) <- c("Community_subset", "Richness")
+head(rich_dat)
+rich_dat$Community_subset <- factor(rich_dat$Community_subset, levels = c("Terrestrial", "Switcher", "Marine"))
+
+mu2 <- ddply(rich_dat,
+            "Community_subset", summarise,
+            grp.mean=mean(Richness),
+            grp.sd=sd(Richness),
+            U_CI = grp.mean + 1.96*(grp.sd/sqrt(1000)),
+            L_CI = grp.mean - 1.96*(grp.sd/sqrt(1000))
+            )
+head(mu2)
+
+#      forage_cols#"#66C2A5" "#FC8D62" "#8DA0CB"
+
+plot7 <- ggplot(rich_dat, 
+       aes(x=Richness, group=Community_subset)) + 
+  geom_density() +   
+  geom_vline(data=mu2, aes(xintercept=grp.mean,
+                          color=Community_subset),
+             linetype="dashed", size=1.5) +
+  facet_wrap(~Community_subset, ncol = 1) +
+  theme_bw() +
+  geom_rect(data=mu2, aes(x=NULL, y=NULL,
+                        xmin = L_CI, xmax = U_CI,
+                        ymin = -Inf, ymax = Inf),
+              fill = "lightgrey", alpha=0.5) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=16),
+        axis.title = element_text(size=20),
+        strip.text = element_text(size=16)) +
+  xlab("Richness") + ylab("Bootstrap density estimate") +    scale_color_manual(values = c("#66C2A5","#FC8D62", "#8DA0CB"))
+
+plot7
+
+#ggsave('goose_mb_bootstrap_est_richness_density_plot.jpeg', plot7, width=10, height=10 )
+
+```
+
+# BETA DIVERSITY 
+
+## Stacked Bar Plots
+```{r}
+####4.1 Stacked Bar Plots####
+
+#What Are the Names of the most abundant phyla?  
+  brent_phylumcollapse <- brent_samp_filt %>% aggregate_taxa(level="Phylum")
+  brent_top5phyla = names(sort(taxa_sums(brent_phylumcollapse), TRUE)[1:5])
+
+#Subset the phyloseq object to those phyla   
+  brent_top5phylum_filter<-subset_taxa(brent_samp_filt,Phylum %in% brent_top5phyla)
+
+#Aggregate To Phylum Level and Transform to Relative Abundance  
+
+    brent_clean2_phylum <-  prune_samples(!is.na(sample_data(brent_top5phylum_filter)$foraging_phenotype),brent_top5phylum_filter) %>%
+      aggregate_taxa(level = "Phylum") %>%  
+      microbiome::transform(transform = "compositional")
+    sample_data(brent_clean2_phylum)$foraging_phenotype <- factor(sample_data(brent_clean2_phylum)$foraging_phenotype)
+
+## PLOT BY FORAGING PHENOTYPE 
+    brent_phylum_barplot <- brent_clean2_phylum %>%
+      plot_composition(sample.sort = "Firmicutes", average_by = "foraging_phenotype")
+    
+palette1 <- (brewer.pal(n=5,name="Dark2"))
+palette1
+
+    plot8 <- brent_phylum_barplot + theme_bw() +
+      xlab('Foraging phenotype') + ylab('Relative abundance') + guides(fill=guide_legend(title="Phylum"))  + plotopts +
+    scale_x_discrete(limits=c("Terrestrial", "Switcher","Marine")) +
+        scale_fill_manual("Phylum",values =palette1) 
+    #+ theme(legend.position = "right",legend.text=element_text(size=12),legend.title=element_text(size=12),axis.text=element_text(size=12),axis.title=element_text(size=12)) 
+
+plot8
+# ggsave('goose_mb_relative_abundance_foragingpheno_stackedbar_phylum.pdf', plot8, width=10, height=10 )
+# ggsave('goose_mb_relative_abundance_foragingpheno_stackedbar_phylum.jpeg', plot8, width=10, height=10 )
+
+#plot one bar per individual
+## PLOT BY FORAGING PHENOTYPE 
+    brent_phylum_barplot_ind <- brent_clean2_phylum %>%
+      plot_composition(sample.sort = "Firmicutes", average_by = "id")
+    plot9 <- brent_phylum_barplot_ind + theme_bw() +
+      xlab('Ring ID') + ylab('Relative abundance') + guides(fill=guide_legend(title="Phylum"))  +plotopts +
+      theme(axis.text.x = element_text(angle = 90))
+    #+ theme(legend.position = "right",legend.text=element_text(size=12),legend.title=element_text(size=12),axis.text=element_text(size=12),axis.title=element_text(size=12)) 
+
+plot9
+#ggsave('goose_mb_relative_abundance_individuals_stackedbar_phylum.jpeg', plot9, width=15, height=10 )
+```
+
+## CLR-Transformed Diversity
+
+ NEW CLR-TRANSFORM METHOD FOR BETA DIVERSITY    (NO RAREFYING NEEDED)
+```{r}
+
+#Sample for Stripping out the ASV matrix from a phyloseq object (run all of this)
+    vegan_otu <- function(physeq) {
+      OTU <- otu_table(physeq)
+      if (taxa_are_rows(OTU)) {
+        OTU <- t(OTU)
+      }
+      return(as(OTU, "matrix"))
+    }
+
+
+#Centred Log Ratio (CLR) Transform  on unrarefied object - See Gloor Paper
+  brent_clr <- microbiome::transform(brent_samp_filt, "clr")
+
+#Strip Out Samples With No Foraging/site Info 
+    brent_clr <- prune_samples(!is.na(sample_data(brent_clr)$foraging_phenotype) & sample_data(brent_clr)$site!="",brent_clr)
+    brent_clr
+
+#Extract Matrix and Sample Data  
+    brent_clr_v <- vegan_otu(brent_clr)
+    brent_clr_s <- as(sample_data(brent_clr),"data.frame")
+```
+
+
+## PCA PLot
+```{r}
+
+##PCA In Vegan 
+goose_habitat_clr_pca <- rda(brent_clr_v)
+
+#Plot and Extract for GGPLot2
+    x1 <- gg_ordiplot(goose_habitat_clr_pca,groups=brent_clr_s$foraging_phenotype,spiders = TRUE,plot=FALSE) 
+    x1_plotdata<- x1$df_ord
+
+  #Plot Spiders  
+    goose_habitat_clr_plot1<-ggplot(x1_plotdata,aes(x=x,y=y)) + geom_segment(data=x1$df_spiders, aes(x=cntr.x, xend=x, y=cntr.y, yend=y, color=Group), show.legend = FALSE) 
+  #Plot Points  
+    goose_habitat_clr_plot2<- goose_habitat_clr_plot1 + geom_point(shape=21,color="white",aes(fill=Group),size=5) + theme_bw()
+ #Colour
+    goose_habitat_clr_plot3<- goose_habitat_clr_plot2 + scale_colour_manual(values=forage_cols,breaks=c("Terrestrial","Marine","Switcher"))  + scale_fill_manual(values=forage_cols,breaks=c("Terrestrial","Marine","Switcher"))
+    goose_habitat_clr_plot4<- goose_habitat_clr_plot3 + labs(x="PC1 (13.74%)",y="PC2 (6.49%)",fill="Foraging Phenotype") + plotopts + guides(fill="none") #+ theme(legend.position = "bottom") + theme(legend.text = element_text(size=14),legend.title = element_text(size=14))
+    
+goose_habitat_clr_plot4
+# ggsave2('CLR Beta Diversity By Foraging.pdf',goose_habitat_clr_plot3,width=10,height=10)
+# ggsave2('CLR Beta Diversity By Foraging.jpeg',goose_habitat_clr_plot3,width=10,height=10)
+```
+
+```{r}
+####PERMANOVA Using these CLR Matrices (replaces rarefied analysis again)####
+          
+## We feed the CLR matrix to vegan and tell it to use Euclidean distance rather than Bray-Curtis or UNIFRAC (see Gloor paper)
+set.seed(123)
+
+brent_perm_sampletype <- adonis2(brent_clr_v2 ~ foraging_phenotype, 
+                                            data = brent_clr_s2,
+                                            nperm = 9999,
+                                            method = "euclidean")
+
+brent_perm_sampletype
+
+#pairwise group differences
+library(devtools)
+#install_github("pmartinezarbizu/pairwiseAdonis/pairwiseAdonis")
+library(pairwiseAdonis)
+
+pairwise_adnois_results <- pairwise.adonis2(brent_clr_v ~ foraging_phenotype, data=brent_clr_s,
+                 nperm=9999, method="euclidean")
+pairwise_adnois_results
+
+#test for differences in group dispersions
+meta <- as(sample_data(brent_clr), 'data.frame') #make a dataframe from the sample metadata
+dist <- distance(brent_clr, method = "euclidean", type = "samples") #euclidean distance matrix
+
+beta <- betadisper(dist, meta$foraging_phenotype) #replace XXX with variable of interest 
+permutest(beta) #permutational test of group dispersions
+
+boxplot(beta) #boxplots of group dispersions
+TukeyHSD(beta)
+```
+
+## Proportion Marine By PC1
+Extract PC1 scores and plot by Proportion Marine (PC1 seems to be a weakly discriminant axis for diet)
+```{r}
+#Extract Scores
+  goose_pc_scores<- scores(goose_habitat_clr_pca)$sites %>% as.data.frame()
+
+#Label by Goose
+  goose_pc_scores$Sample<-rownames(goose_pc_scores)
+
+#Stitch onto REsighting Data  
+  meta<-left_join(meta,goose_pc_scores,"Sample")
+  
+#Filter Missing Data
+  meta_filter<- meta %>% filter(!is.na(foraging_phenotype)) %>% mutate(foraging_phenotype=factor(foraging_phenotype)) 
+  nrow(meta_filter)
+
+  head(meta_filter)
+
+
+## Plot
+dev.off()
+  
+pc1_plot1<-ggplot(meta_filter,aes(x=proportion_marine_total,y=PC1)) + geom_smooth(method="lm", se=F) + geom_point(size=5,shape=21,aes(fill=foraging_phenotype)) + theme_bw() + plotopts
+  pc1_plot2<- pc1_plot1 + labs(x="Proportion Marine Sites",y="PC1 (Beta Diversity)",fill="Foraging Phenotype") + 
+    theme(legend.position = c(0.01,.95),
+          legend.justification = c("left", "top")) + 
+    scale_fill_manual(values=c("#8DA0CB","#FFD92F", "#66C2A5"))
+  pc1_plot2
+  
+  forage_cols#"#66C2A5" "#8DA0CB" "#FFD92F"
+# ggsave('goose_mb_prop_marine_PC1_scatterplot.pdf', pc1_plot2, width=10, height=10 )
+# ggsave('goose_mb_prop_marine_PC1_scatterplot.jpeg', pc1_plot2, width=10, height=10 )
+```
+
+## Model of  Proportion Marine By PC1
+```{r}
+
+pc1_mar_mod1<- brm(PC1 ~ proportion_marine_total + (1|id),data=meta_filter,family=gaussian())
+  summary(pc1_mar_mod1)
+  
+```
+
+## Variance of Groups 
+
+```{r}
+
+#Fit model 
+  # pc1_var_mod<-brm(PC1 ~ 1 + (1|foraging_phenotype/id),data=meta_filter,family=gaussian(),control = list(adapt_delta=0.99))
+  #   summary(pc1_var_mod)
+  #   VarCorr(pc1_var_mod)
+  #   vcov(pc1_var_mod)
+  #   getVarCov(pc1_var_mod, type = "conditional")
+  #   rr <- ranef(pc1_var_mod,condVar=TRUE)
+  #   pv <- attr(rr[[1]],"postVar")
+  #   str(pv)
+# 
+  
+# #Marine    
+#   meta_filter_mar<-meta_filter %>% filter(foraging_phenotype=="Marine")
+#   pc1_var_marine<-brm(PC1 ~ 1 + (1|id),data=meta_filter_mar,family=gaussian(),control = list(adapt_delta=0.99))
+#   summary(pc1_var_marine)
+# #Switcher    
+#   meta_filter_switch<-meta_filter %>% filter(foraging_phenotype=="Switcher")
+#   pc1_var_switch<-brm(PC1 ~ 1 + (1|id),data=meta_filter_switch,family=gaussian(),control = list(adapt_delta=0.99))
+#   summary(pc1_var_switch)
+# #Terrestrial    
+#   meta_filter_terr<-meta_filter %>% filter(foraging_phenotype=="Terrestrial")
+#   pc1_var_terr<-brm(PC1 ~ 1 + (1|id),data=meta_filter_terr,family=gaussian(),control = list(adapt_delta=0.99))
+#   summary(pc1_var_terr)
+# 
+#     with(meta_filter)
+# #Diagnostics 
+#     pp_check(pc1_var_mod)
+#     bayes_R2(pc1_var_mod)
+#     
+#     
+#     ##Test 
+#     fit <- brm(count ~ zAge + zBase * Trt + (1+Trt|visit),
+#            data = epilepsy, family = gaussian(), chains = 2)
+# VarCorr(fit)
+    
+```
+
+## Combined Plot of Alpha and Beta Diversity at Group Level 
+```{r}
+
+library(cowplot)
+
+#Grid One - Regressions
+ alphabeta1<-plot_grid(alpha3_plot3,plot8,ncol=2,labels="AUTO",label_size = 25)
+  alphabeta1
+  
+#Grid Two-CLR and Barplot
+  alphabeta2<-plot_grid(goose_habitat_clr_plot4,pc1_plot2,ncol=2,labels=c("C","D"),label_size = 25,align="h")
+  alphabeta2
+  
+  alpha_beta_grid<-plot_grid(alphabeta1,alphabeta2,nrow=2)
+ alpha_beta_grid
+
+#ggsave2('Figure 1 Alpha Beta Diversity.pdf',alpha_beta_grid,width=30,height=20,units="cm")
+  
+```
+
+#Shared and unique taxa
+
+Calculate Jaccard Index and add sample variable information. (Jaccard Index is 1-Jaccard distance)
+
+```{r}
+
+# Jaccard distance matrix
+D_jacc <- distance(brent_clean_faecal_forage_pa, method = "jaccard", binary=TRUE, type = "samples")
+D_Jacc_melt <- melt(as.matrix(D_jacc)) #melt the matrix to long format
+
+D_Jacc_melt$Sample_pair <- paste(D_Jacc_melt$Var1, D_Jacc_melt$Var2, sep="-")
+head(D_Jacc_melt)
+
+```
+
+This shows the Jaccard distance (value) between each pair of samples in the dataset (Var1 and Var2). Now we need to add foraging phenotype data for each sample in the pair.
+
+```{r}
+meta <- as(sample_data(brent_clean_faecal_forage_pa), 'data.frame') 
+#Match in metadata for the first sample in pair ('Var1')
+colnames(D_Jacc_melt)[1] <- "Sample"      #change column name to match metadata
+D_Jacc_melt$Hab.A <- "NA"         #create new variable
+D_Jacc_melt$Hab.A = meta[match(D_Jacc_melt$Sample, meta$Sample), "foraging_phenotype"] #fill new variable with foraging data from meta
+D_Jacc_melt$ID.A <- "NA"        
+D_Jacc_melt$ID.A = meta[match(D_Jacc_melt$Sample, meta$Sample), "id"] 
+colnames(D_Jacc_melt)[1] <- "Var1" #change column name back (need to use for second sample in pair below)
+
+#repeat for second sample in pair
+colnames(D_Jacc_melt)[2] <- "Sample"   
+D_Jacc_melt$Hab.B <- "NA"           
+D_Jacc_melt$Hab.B = meta[match(D_Jacc_melt$Sample, meta$Sample), "foraging_phenotype"] 
+D_Jacc_melt$ID.B <- "NA"        
+D_Jacc_melt$ID.B = meta[match(D_Jacc_melt$Sample, meta$Sample), "id"] 
+colnames(D_Jacc_melt)[2] <- "Var2" 
+
+D_Jacc_melt$Jaccard_Index<-1-D_Jacc_melt$value #calculate Jaccard Index (1-Jaccard distance)
+
+head(D_Jacc_melt) #look at what we now have
+
+D_Jacc_melt$Hab_pair <- paste(D_Jacc_melt$Hab.A, D_Jacc_melt$Hab.B, sep="-") #creating Hab-pair
+
+#subset out the pairwise comparison within sample and within individual
+D_Jacc_melt_sub <- D_Jacc_melt[D_Jacc_melt$Var1!=D_Jacc_melt$Var2,]
+D_Jacc_melt_sub <- D_Jacc_melt[D_Jacc_melt$ID.A!=D_Jacc_melt$ID.B,]
+
+```
+
+Take a quick look at mean Jaccard Index (proportion of ASVs shared) for each sample type combination. Is it as expected?
+
+```{r}
+
+#Proportion of taxa shared between samples within a foraging phenotype
+mean(subset(D_Jacc_melt_sub, Hab_pair=="Terrestrial-Terrestrial")$Jaccard_Index)
+mean(subset(D_Jacc_melt_sub, Hab_pair=="Marine-Marine")$Jaccard_Index)
+mean(subset(D_Jacc_melt_sub, Hab_pair=="Switcher-Switcher")$Jaccard_Index)
+
+#Proportion of taxa shared between sampels across foraging phenotypes
+mean(subset(D_Jacc_melt_sub, Hab_pair=="Switcher-Terrestrial")$Jaccard_Index)
+mean(subset(D_Jacc_melt_sub, Hab_pair=="Terrestrial-Marine")$Jaccard_Index)
+mean(subset(D_Jacc_melt_sub, Hab_pair=="Switcher-Marine")$Jaccard_Index)
+
+```
+
+Could also have a quick look at a plot:
+
+```{r}
+
+D_Jacc_melt_sub$Hab_pair <- paste(D_Jacc_melt_sub$Hab.A, D_Jacc_melt_sub$Hab.B, sep="-") #create one variable describing the sample pair combination
+
+ggplot(D_Jacc_melt_sub, aes(y = Jaccard_Index, x = Hab_pair)) + 
+  geom_boxplot() +  
+  labs(y="Jaccard Index", x="Foraging phenotype combination") +
+  theme(axis.text.x = element_text(hjust = 1,angle = 45) )
+
+Same_hab <- c("Terrestrial-Terrestrial", "Marine-Marine")
+Switch_TM <- c("Switcher-Terrestrial", "Switcher-Marine", "Marine-Switcher", "Terrestrial-Switcher")
+MT <- c("Marine-Terrestrial", "Terrestrial-Marine")
+
+D_Jacc_melt_sub$Hab_com <- D_Jacc_melt_sub$Hab_pair
+D_Jacc_melt_sub[which(D_Jacc_melt_sub$Hab_pair%in%Same_hab),]$Hab_com <- "Same_hab"
+D_Jacc_melt_sub[which(D_Jacc_melt_sub$Hab_pair%in%Switch_TM),]$Hab_com <- "Switcher_com"
+D_Jacc_melt_sub[which(D_Jacc_melt_sub$Hab_pair%in%MT),]$Hab_com <- "Marine-Terrestrial"
+
+head(D_Jacc_melt_sub)
+summary(as.factor(D_Jacc_melt_sub$Hab_com))
+
+```
+
+Now run permutational tests for differences in proportion of taxa shared within/between foraging phenotypes.
+
+Start with a test to see whether terrestrial and marine samples share significantly less taxa in common than are shared among marine samples.
+MARINE V TERRESTRIAL
+```{r}
+
+#Subset D_Jacc_melt to only those groups we want to test
+D_Jacc_sub <- subset(D_Jacc_melt_sub, Hab_com%in%c("Marine-Terrestrial", "Same_hab"))
+D_Jacc_sub$Hab_com <- as.factor(D_Jacc_sub$Hab_com)
+summary(D_Jacc_sub$Hab_com)
+#Get the observed test statistic
+obs_test <- t.test(Jaccard_Index ~ Hab_com, data=D_Jacc_sub)
+obs_test
+obs_test$statistic #gives the t-statistic
+
+```
+
+Run the permutation
+
+```{r}
+
+Nperm <- 1000 #specify the number of permutations to run
+perm1 <- data.frame(permutation=1:Nperm, t.stat=NA) #create an empty dataframe to store the results in
+lose<-"Jaccard_Index" #specify the name of the variable for permutations (the similarity value)
+
+#run for loop for permutations
+for (i in 1:Nperm) { #do the following Nperm number of times:
+  d <- D_Jacc_sub[,!names(D_Jacc_sub) %in% lose] #create a new dataframe from the D_Jacc_sub dataframe with 'Jaccard_Index' column removed
+  d$dist.rand <- sample(D_Jacc_sub$Jaccard_Index, length(D_Jacc_sub$Jaccard_Index), replace=F) #add a new variable 'dist.rand' by taking a random sample of the 'Jaccard_Index' column in the original data, without replacement. This means we are SHUFFLING the Jaccard Index values there are in the dataset among sample pairs randomly.  
+  x<-t.test(dist.rand ~ Hab_com, data=d) #perform a t-test on this permuted data
+  perm1$t.stat[i]<-x$statistic #store the t-statistic in the perm1 dataframe, in a column called t.stat
+}
+
+head(perm1) #look at the first few rows of this permutation file
+
+```
+
+Plot a distribution of the t-statistic values we get with the permuted data:  
+
+```{r}
+
+hist(perm1$t.stat) 
+obs_test$statistic
+#draw a vertical line on here showing where our observed test statistic lies compared to this distribution
+abline(v=obs_test$statistic, col="red", lwd=2, lty=2)
+
+```
+
+Calculate p value (how many times our observed t-statistic was lower than the permuted statistics)
+```{r}
+
+perm1$result <- ifelse(perm1$t.stat < obs_test$statistic, 1, 0) #if obs < permuted give the 'result' 1, otherwise 0 (n.b. might need to change the direction of this around depending on which factor comes first alphabetically! i.e. > or <)
+p<-2*(mean(perm1$result)) #calculate the p-value
+p
+
+```
+
+Now you can repeat the above code and run more permutation tests for different sample type combinations - yay!
+
+SWITCHER COMPARISON
+```{r} 
+
+#Subset D_Jacc_melt to only those groups we want to test
+D_Jacc_sub <- subset(D_Jacc_melt_sub, Hab_com%in%c("Switcher_com", "Same_hab"))
+D_Jacc_sub$Hab_com <- as.factor(D_Jacc_sub$Hab_com)
+summary(D_Jacc_sub$Hab_com)
+#Get the observed test statistic
+obs_test <- t.test(Jaccard_Index ~ Hab_com, data=D_Jacc_sub)
+obs_test
+obs_test$statistic #gives the t-statistic
+
+```
+
+Run the permutation
+
+```{r}
+
+Nperm <- 1000 #specify the number of permutations to run
+perm1 <- data.frame(permutation=1:Nperm, t.stat=NA) #create an empty dataframe to store the results in
+lose<-"Jaccard_Index" #specify the name of the variable for permutations (the similarity value)
+
+#run for loop for permutations
+for (i in 1:Nperm) { #do the following Nperm number of times:
+  d <- D_Jacc_sub[,!names(D_Jacc_sub) %in% lose] #create a new dataframe from the D_Jacc_sub dataframe with 'Jaccard_Index' column removed
+  d$dist.rand <- sample(D_Jacc_sub$Jaccard_Index, length(D_Jacc_sub$Jaccard_Index), replace=F) #add a new variable 'dist.rand' by taking a random sample of the 'Jaccard_Index' column in the original data, without replacement. This means we are SHUFFLING the Jaccard Index values there are in the dataset among sample pairs randomly.  
+  x<-t.test(dist.rand ~ Hab_com, data=d) #perform a t-test on this permuted data
+  perm1$t.stat[i]<-x$statistic #store the t-statistic in the perm1 dataframe, in a column called t.stat
+}
+
+head(perm1) #look at the first few rows of this permutation file
+
+```
+
+Plot a distribution of the t-statistic values we get with the permuted data:  
+
+```{r}
+
+hist(perm1$t.stat) 
+obs_test$statistic
+#draw a vertical line on here showing where our observed test statistic lies compared to this distribution
+abline(v=obs_test$statistic, col="red", lwd=2, lty=2)
+
+```
+
+Calculate p value (how many times our observed t-statistic was lower than the permuted statistics)
+```{r}
+
+perm1$result <- ifelse(perm1$t.stat > obs_test$statistic, 1, 0) #if obs < permuted give the 'result' 1, otherwise 0 (n.b. might need to change the direction of this around depending on which factor comes first alphabetically! i.e. > or <)
+p<-2*(mean(perm1$result)) #calculate the p-value
+p
+
+```
+
+SWITCHER VS TM -THE BIG ONE
+```{r}
+
+#Subset D_Jacc_melt to only those groups we want to test
+D_Jacc_sub <- subset(D_Jacc_melt_sub, Hab_com%in%c("Marine-Terrestrial", "Switcher_com"))
+D_Jacc_sub$Hab_com <- as.factor(D_Jacc_sub$Hab_com)
+summary(D_Jacc_sub$Hab_com)
+#Get the observed test statistic
+obs_test <- t.test(Jaccard_Index ~ Hab_com, data=D_Jacc_sub)
+obs_test
+obs_test$statistic #gives the t-statistic
+
+```
+
+Run the permutation
+
+```{r}
+
+Nperm <- 1000 #specify the number of permutations to run
+perm1 <- data.frame(permutation=1:Nperm, t.stat=NA) #create an empty dataframe to store the results in
+lose<-"Jaccard_Index" #specify the name of the variable for permutations (the similarity value)
+
+#run for loop for permutations
+for (i in 1:Nperm) { #do the following Nperm number of times:
+  d <- D_Jacc_sub[,!names(D_Jacc_sub) %in% lose] #create a new dataframe from the D_Jacc_sub dataframe with 'Jaccard_Index' column removed
+  d$dist.rand <- sample(D_Jacc_sub$Jaccard_Index, length(D_Jacc_sub$Jaccard_Index), replace=F) #add a new variable 'dist.rand' by taking a random sample of the 'Jaccard_Index' column in the original data, without replacement. This means we are SHUFFLING the Jaccard Index values there are in the dataset among sample pairs randomly.  
+  x<-t.test(dist.rand ~ Hab_com, data=d) #perform a t-test on this permuted data
+  perm1$t.stat[i]<-x$statistic #store the t-statistic in the perm1 dataframe, in a column called t.stat
+}
+
+head(perm1) #look at the first few rows of this permutation file
+
+```
+
+Plot a distribution of the t-statistic values we get with the permuted data:  
+
+```{r}
+
+hist(perm1$t.stat) 
+obs_test$statistic
+#draw a vertical line on here showing where our observed test statistic lies compared to this distribution
+abline(v=obs_test$statistic, col="red", lwd=2, lty=2)
+
+```
+
+Calculate p value (how many times our observed t-statistic was lower than the permuted statistics)
+```{r}
+
+perm1$result <- ifelse(perm1$t.stat < obs_test$statistic, 1, 0) #if obs < permuted give the 'result' 1, otherwise 0 (n.b. might need to change the direction of this around depending on which factor comes first alphabetically! i.e. > or <)
+p<-2*(mean(perm1$result)) #calculate the p-value
+p
+
+```
+Make plots to go with these stats
+```{r}
+
+#### 1. All groups
+#group same comparisons together in new column (e.g. M-T and T-M)
+SM <- c("Switcher-Marine", "Marine-Switcher")
+ST <- c("Terrestrial-Switcher", "Switcher-Terrestrial")
+MT <- c("Marine-Terrestrial", "Terrestrial-Marine")
+
+D_Jacc_melt_sub$Same_comp <- D_Jacc_melt_sub$Hab_pair
+D_Jacc_melt_sub[which(D_Jacc_melt_sub$Hab_pair%in%SM),]$Same_comp <- "Switcher-Marine"
+D_Jacc_melt_sub[which(D_Jacc_melt_sub$Hab_pair%in%ST),]$Same_comp <- "Switcher-Terrestrial"
+D_Jacc_melt_sub[which(D_Jacc_melt_sub$Hab_pair%in%MT),]$Same_comp <- "Marine-Terrestrial"
+
+plot <- ggplot(D_Jacc_melt_sub, 
+       aes(y = Jaccard_Index,
+           x = factor(Same_comp, 
+                      levels = c("Marine-Marine","Terrestrial-Terrestrial",
+                                  "Switcher-Switcher","Switcher-Marine",
+                                  "Switcher-Terrestrial", "Marine-Terrestrial")))) + 
+  geom_violin(fill="lightgrey", colour="darkgrey") +  
+  labs(y="Jaccard Index", x="Foraging phenotype combination") +
+    theme_bw() +
+  theme(axis.text = element_text(size=16), 
+        axis.title = element_text(size=20) ) +
+  scale_x_discrete(labels=c("M-M", "T-T", "S-S", "S-M", "S-T", "M-T"))
+  
+plot2 <- plot + stat_summary(fun=median, geom="point", size=2.5, shape=23, stroke=1, colour="darkgrey")
+
+plot2
+
+#ggsave('goose_mb_JaccardIndex_habitat_comparisons_full_voilin.jpeg', plot2,width=10,height=10 )
+```
+
+```{r}
+### 2. Groups tested
+
+plot3 <- ggplot(subset(D_Jacc_melt_sub, Hab_com!="Switcher-Switcher"), 
+             aes(x=factor(Hab_com, levels = c("Same_hab", "Switcher_com",
+                                              "Marine-Terrestrial")),
+                 y=Jaccard_Index)) +
+  geom_violin(fill="lightgrey", colour="darkgrey") +
+  xlab("Habitat comparison") + 
+  ylab("Proportion of taxa shared (Jaccard Index)") +
+  ylim(0,0.45) + #leave space to add sig brackets in Aff Des
+  theme(axis.text = element_text(size=16), 
+        axis.title = element_text(size=18)) +
+  theme_bw() +
+  scale_x_discrete(labels=c("Same habitat \n (M-M/T-T)", 
+                            "Switcher-habitats \n (S-M/S-T)", 
+                            "Different habitats \n (M-T)")) 
+
+plot3
+
+#ggsave('goose_mb_JaccardIndex_habitat_comparisons.pdf', plot3,       width=10,height=10 )
+
+```
+
+### Network plot and stacked bar of shared/unique taxa
+
+#### Bootstrap sampled dataset
+
+This would work as follows; pick a random selection of samples from each habitat (marine group has lowest n=17), calculate the number of unique/shared ASVs, repeat X number of times. We can then look at the distribution of these numbers and see how close our 'observed' values without subsetting were. update - becuase each time we subset there might be a slightly different number of ASVs kept in total, we should caluclate proportions of shared ASVs and not just the actual number
+
+```{r}
+brent_clean_faecal_forage
+meta <- as(sample_data(brent_clean_faecal_forage), 'data.frame')
+pheno_sum <- meta %>% group_by(id) %>% sample_n(1) 
+summary(as.factor(pheno_sum$foraging_phenotype))#T=20, S=15, M=6
+
+set.seed(123)
+#create df to store results
+subsample_iteration_dat <- data.frame(Iteration=NA, Ncommon=NA, NunqM=NA, NunqT=NA, NunqS=NA, commonMT=NA, commonMS=NA, commonST=NA)
+nrep <- 1000
+
+for(i in 1:nrep) {
+  #select random samples for each habitat
+    sample_sub <- as.data.frame(sample_data(brent_clean_faecal_forage) %>%
+                                  group_by(id) %>% sample_n(1) %>%
+                              group_by(foraging_phenotype) %>% 
+                              sample_n(6))
+    rownames(sample_sub) <- sample_sub$Sample
+    temp.ps <- phyloseq(otu_table(otu_table(brent_clean_faecal_forage)), 
+                    tax_table(tax_table(brent_clean_faecal_forage)),
+                    sample_data(sample_sub))
+    temp.ps <- prune_taxa(taxa_sums(temp.ps) > 0,
+                                 temp.ps)
+    ntax <- ntaxa(temp.ps)
+#subset phyloseq objects per habitat and get list of ASVs present
+    brent_phy_switcher <- subset_samples(temp.ps, 
+                                     foraging_phenotype=="Switcher")
+    brent_phy_switcher <- prune_taxa(taxa_sums(brent_phy_switcher) > 0,
+                                 brent_phy_switcher)
+    Switcher_list <- taxa_names(brent_phy_switcher)
+    brent_phy_marine <- subset_samples(temp.ps, 
+                                   foraging_phenotype=="Marine")
+    brent_phy_marine <- prune_taxa(taxa_sums(brent_phy_marine) > 0, 
+                               brent_phy_marine)
+    Marine_list <- taxa_names(brent_phy_marine) 
+    brent_phy_terr <- subset_samples(temp.ps, 
+                                 foraging_phenotype=="Terrestrial")
+    brent_phy_terr <- prune_taxa(taxa_sums(brent_phy_terr) > 0, 
+                             brent_phy_terr)
+    Terr_list <- taxa_names(brent_phy_terr) 
+#calculate the number of shared/unique ASVs
+    common <- (length(intersect(intersect(Terr_list, Marine_list), Switcher_list))/ntax)
+    unqM <- (length(setdiff(setdiff(Marine_list, Terr_list),Switcher_list))/ntax) 
+    unqT <- (length(setdiff(setdiff(Terr_list, Marine_list),Switcher_list))/ntax) 
+    unqS <- (length(setdiff(setdiff(Switcher_list,Marine_list), Terr_list))/ntax) 
+    commonMT <- (length(setdiff(intersect(Marine_list, Terr_list), Switcher_list))/ntax)
+    commonMS <- (length(setdiff(intersect(Marine_list, Switcher_list), Terr_list))/ntax)
+    commonST <- (length(setdiff(intersect(Terr_list, Switcher_list), Marine_list))/ntax)
+#store results in df
+    subsample_iteration_dat[i, 1] <- i
+    subsample_iteration_dat[i, 2] <- common
+    subsample_iteration_dat[i, 3] <- unqM
+    subsample_iteration_dat[i, 4] <- unqT
+    subsample_iteration_dat[i, 5] <- unqS
+    subsample_iteration_dat[i, 6] <- commonMT
+    subsample_iteration_dat[i, 7] <- commonMS
+    subsample_iteration_dat[i, 8] <- commonST
+
+}
+
+head(subsample_iteration_dat)
+
+```
+Reshape for plotting
+
+```{r}
+
+subsample_iteration_dat_melt <- melt(subsample_iteration_dat[2:8])
+head(subsample_iteration_dat_melt)
+colnames(subsample_iteration_dat_melt) <- c("Community_subset", "N_taxa")
+
+mu <- ddply(subsample_iteration_dat_melt,
+            "Community_subset", summarise,
+            grp.mean=mean(N_taxa),
+            grp.sd=sd(N_taxa),
+            U_CI = grp.mean+ 1.96*(grp.sd/sqrt(1000)),
+            L_CI = grp.mean- 1.96*(grp.sd/sqrt(1000))
+            )
+mu
+
+community <- c("Ncommon" = "Common (MST)",
+                "NunqM" = "Unique (M)",
+                "NunqT" = "Unique (T)",
+                "NunqS" = "Unique (S)" )
+
+plot6 <- ggplot(subsample_iteration_dat_melt, 
+       aes(x=N_taxa, group=Community_subset)) + 
+  geom_density() +   
+  geom_vline(data=mu, aes(xintercept=grp.mean,
+                          color=Community_subset),
+             linetype="dashed") +
+  facet_wrap(~Community_subset, labeller = as_labeller(community)) +
+  theme_bw() +
+    geom_rect(data=mu, aes(x=NULL, y=NULL,
+                           xmin = L_CI, xmax = U_CI,
+                        ymin = -Inf, ymax = Inf),
+           fill = "lightgrey", alpha=0.5) +
+  theme(legend.position = "none",
+        axis.text = element_text(size=16),
+        axis.title = element_text(size=20),
+        strip.text = element_text(size=16)) +
+  xlab("Proportion of taxa(/total)") + ylab("Bootstrap density estimate")
+
+plot6
+#ggsave('goose_mb_bootstrap_est_common_unique_subsets_density_plot.jpeg', plot6, width=10, height=10 )
+
+```
+
+Now re-create the network and stacked barplots using one subset of 17 samples per group as an example (make sure to set seed so that it's reproducible!)
+
+```{r}
+
+set.seed(123)
+sample_sub <- as.data.frame(sample_data(brent_clean_faecal_forage) %>%
+                              group_by(id) %>% sample_n(1) %>%
+                              group_by(foraging_phenotype) %>% 
+                              sample_n(6))
+rownames(sample_sub) <- sample_sub$Sample
+ps3_sub <- phyloseq(otu_table(otu_table(brent_clean_faecal_forage)), 
+                    tax_table(tax_table(brent_clean_faecal_forage)),
+                    sample_data(sample_sub))
+
+ps3_sub <- prune_taxa(taxa_sums(ps3_sub) > 0, ps3_sub)
+ps3_sub 
+                    
+#saveRDS(ps3_sub, "Brent_physeq_bootstrap_subsample_17_per_group.rds")
+
+```
+
+Re-run above section with 'ps3_sub'
+
+```{r}
+
+brent_phy_switcher <- subset_samples(ps3_sub, foraging_phenotype=="Switcher")
+brent_phy_switcher <- prune_taxa(taxa_sums(brent_phy_switcher) > 0, brent_phy_switcher)
+Switcher_list <- taxa_names(brent_phy_switcher) #1019 ASVs
+
+brent_phy_marine <- subset_samples(ps3_sub, foraging_phenotype=="Marine")
+brent_phy_marine <- prune_taxa(taxa_sums(brent_phy_marine) > 0, brent_phy_marine)
+Marine_list <- taxa_names(brent_phy_marine) #1414 ASVs
+
+brent_phy_terr <- subset_samples(ps3_sub, foraging_phenotype=="Terrestrial")
+brent_phy_terr <- prune_taxa(taxa_sums(brent_phy_terr) > 0, brent_phy_terr)
+Terr_list <- taxa_names(brent_phy_terr) #569 ASVs
+
+```
+
+Prepare adjacency matrix of ASV/habitat nodes and make the graph object
+
+```{r}
+
+brent_phy_glom <- merge_samples(ps3_sub, "foraging_phenotype")
+otu_table(brent_phy_glom)[,1:10]
+
+otu_tab <- as.data.frame(t(otu_table(brent_phy_glom)))
+head(otu_tab)
+
+#make an adjacency matrix with just presence/absence 
+otu_tab_pa <- otu_tab
+otu_tab_pa$Marine[otu_tab_pa$Marine>0] <- 1
+otu_tab_pa$Terrestrial[otu_tab_pa$Terrestrial>0] <- 1
+otu_tab_pa$Switcher[otu_tab_pa$Switcher>0] <- 1
+head(otu_tab_pa)
+
+g <- graph_from_incidence_matrix(otu_tab_pa)
+
+```
+
+Prep node attribute dataframe starting from ASV tax tab and adding to it
+
+```{r}
+
+tax_tab <- as.data.frame(tax_table(brent_phy_glom))
+head(tax_tab)
+
+#create a habitat node dataframe to combine to this
+hab_dat <- data.frame(Kingdom=c("Marine", "Switcher", "Terrestrial"),
+                      Phylum=c("Marine", "Switcher", "Terrestrial"),
+                      Class=c("Marine", "Switcher", "Terrestrial"),
+                      Order=c("Marine", "Switcher", "Terrestrial"),
+                      Family=c("Marine", "Switcher", "Terrestrial"),
+                      Genus=c("Marine", "Switcher", "Terrestrial"))
+rownames(hab_dat) <- c("Marine", "Switcher", "Terrestrial")
+hab_dat
+
+Node_attr <- rbind(tax_tab, hab_dat)
+head(Node_attr)
+
+#add column specifying type of node (ASV=False, habitat=True, as in the network)
+node_type <- V(g)$type
+Node_attr$type <- node_type#1247
+#the first 1244 rows in this dataframe are ASVs, the last 3 are habitat
+Node_attr$shape <- "NA"
+Node_attr$shape[Node_attr$type==F] <- "circle"
+Node_attr$shape[Node_attr$type==T] <- "square"
+Node_attr$label <- c(rep(NA,1244 ), "Marine", "Switcher", "Terrestrial")
+
+#add these attributes to the graph object
+ V(g)$shape <- Node_attr$shape
+ V(g)$label <- Node_attr$label
+ 
+```
+Now need to sort out the colours. We want to colour the ASVs by the Phylum they belong to, but first need to reduce the number of colours by combining less common Phyla into an 'other' category
+
+```{r}
+
+#which phyla to combine?
+Phy_sum <- data.frame(summary(as.factor(tax_table(ps3_sub)[,2])))
+Phy_sum$Phylum <- rownames(Phy_sum)
+names(Phy_sum)[1]<- "sum"
+Phy_sum <- arrange(Phy_sum, sum)
+nrow(subset(Phy_sum, sum>100))
+
+```
+
+```{r}
+group_phy <- subset(Phy_sum, sum<100)$Phylum
+#as.list(group_phy)
+Node_attr$Phylum <- Node_attr$Phylum %>% fct_collapse(Other = as.list(group_phy))
+summary(Node_attr$Phylum)
+
+V(g)$Phylum <- as.character(Node_attr$Phylum)
+
+#pick new colour palette 
+length(unique(Node_attr$Phylum))
+palette <- (brewer.pal(n=8,name="Dark2"))
+palette
+
+#marine= #0066CC
+#switcher = #009999
+#terrest= #00CC66
+#"#66C2A5" "#8DA0CB" "#FC8D62"
+
+
+group.colors <- c(Other = "#1B9E77", Actinobacteria = "#D95F02", Bacteroidetes ="#66A61E", 
+                  Firmicutes = "#E6AB02", Proteobacteria = "#7570B3",
+                  Marine = "#8DA0CB", Terrestrial= "#66C2A5", Switcher= "#FC8D62")
+
+```
+
+Make the network plot!
+
+```{r}
+
+#play aorund with setting the size of the nodes
+node.size<-setNames(c(rep(5,1244), rep(25,3)),
+                    V(g)$name)
+ 
+plot7 <-  ggraph(g, layout = "kk", kkconst=8000) +
+  geom_edge_link(color="grey90", alpha=1) + 
+  geom_node_point(size=node.size, 
+                  aes(fill=factor(Phylum)),
+                  colour="grey98",
+                  shape=21) +
+  geom_node_text(aes(label = V(g)$label)) +
+  scale_fill_manual("Phylum",values =group.colors) +
+  theme(legend.text = element_text(size=18),
+        legend.title = element_text(size=20),
+        panel.background = element_rect(fill = "white"),
+        legend.position = "none") +
+  guides(fill = guide_legend(override.aes = list(size=8)))
+
+plot7
+
+#ggsave('goose_bipartite_network_marine_terrest_switcher_bootstrap17_plot.pdf', plot7,width=15,height=10)
+#--> further editing in Aff Des
+
+```
+
+Now make stacked barplots of the taxonomic distribution per cluster of ASVs.
+
+```{r}
+
+#unique
+brent_phy_switcher_unq <- subset_taxa(brent_phy_switcher, 
+                                 !taxa_names(brent_phy_switcher)%in%Marine_list &
+                                 !taxa_names(brent_phy_switcher)%in%Terr_list)
+brent_phy_switcher_unq 
+
+brent_phy_marine_unq <- subset_taxa(brent_phy_marine, 
+                                    !taxa_names(brent_phy_marine)%in%Switcher_list &
+                                    !taxa_names(brent_phy_marine)%in%Terr_list)
+brent_phy_marine_unq 
+
+brent_phy_terr_unq <- subset_taxa(brent_phy_terr, 
+                                  !taxa_names(brent_phy_terr)%in%Marine_list &
+                                  !taxa_names(brent_phy_terr)%in%Switcher_list)
+brent_phy_terr_unq 
+
+#shared
+
+#M-S-T
+common_all <- as.list(intersect(intersect(Marine_list, Terr_list),Switcher_list))
+brent_phy_shared_all <- subset_taxa(ps3_sub, taxa_names(ps3_sub)%in%common_all)
+brent_phy_shared_all
+
+#M-T
+common_MT <- as.list(setdiff(intersect(Marine_list, Terr_list), Switcher_list))
+brent_phy_shared_MT <- subset_taxa(ps3_sub, taxa_names(ps3_sub)%in%common_MT)
+brent_phy_shared_MT
+#M-S
+common_MS <- as.list(setdiff(intersect(Marine_list, Switcher_list), Terr_list))
+brent_phy_shared_MS <- subset_taxa(ps3_sub, taxa_names(ps3_sub)%in%common_MS)
+brent_phy_shared_MS
+#S-T
+common_ST <- as.list(setdiff(intersect(Terr_list, Switcher_list), Marine_list))
+brent_phy_shared_ST <- subset_taxa(ps3_sub, taxa_names(ps3_sub)%in%common_ST)
+brent_phy_shared_ST
+
+#Now summarise the taxonomy for each subset (Phylum level)
+
+#unique
+#Marine
+Marine_unq_tax <- as.data.frame(tax_table(brent_phy_marine_unq))
+Marine_unq_phy <- as.data.frame(summary(as.factor(Marine_unq_tax$Phylum)))
+Marine_unq_phy$Phylum <- rownames(Marine_unq_phy)
+Marine_unq_phy$subset <- "Marine"
+colnames(Marine_unq_phy) <- c("tax_total","Phylum", "subset")
+#Terrestrial
+Terr_unq_tax <- as.data.frame(tax_table(brent_phy_terr_unq))
+Terr_unq_phy <- as.data.frame(summary(as.factor(Terr_unq_tax$Phylum)))
+Terr_unq_phy$Phylum <- rownames(Terr_unq_phy)
+Terr_unq_phy$subset <- "Terrestrial"
+colnames(Terr_unq_phy) <- c("tax_total","Phylum", "subset")
+#Switcher
+Swit_unq_tax <- as.data.frame(tax_table(brent_phy_switcher_unq))
+Swit_unq_phy <- as.data.frame(summary(as.factor(Swit_unq_tax$Phylum)))
+Swit_unq_phy$Phylum<- rownames(Swit_unq_phy)
+Swit_unq_phy$subset <- "Switcher"
+colnames(Swit_unq_phy) <- c("tax_total","Phylum", "subset")
+
+#shared
+#MT
+shared_MT_tax <- as.data.frame(tax_table(brent_phy_shared_MT))
+shared_MT_phy <- as.data.frame(summary(as.factor(shared_MT_tax$Phylum)))
+shared_MT_phy$Phylum <- rownames(shared_MT_phy)
+shared_MT_phy$subset <- "MT"
+colnames(shared_MT_phy) <- c("tax_total","Phylum", "subset")
+#MS
+shared_MS_tax <- as.data.frame(tax_table(brent_phy_shared_MS))
+shared_MS_phy <- as.data.frame(summary(as.factor(shared_MS_tax$Phylum)))
+shared_MS_phy$Phylum <- rownames(shared_MS_phy)
+shared_MS_phy$subset <- "MS"
+colnames(shared_MS_phy) <- c("tax_total","Phylum", "subset")
+#ST
+shared_ST_tax <- as.data.frame(tax_table(brent_phy_shared_ST))
+shared_ST_phy <- as.data.frame(summary(as.factor(shared_ST_tax$Phylum)))
+shared_ST_phy$Phylum <- rownames(shared_ST_phy)
+shared_ST_phy$subset <- "ST"
+colnames(shared_ST_phy) <- c("tax_total","Phylum", "subset")
+#all
+shared_MST_tax <- as.data.frame(tax_table(brent_phy_shared_all))
+shared_MST_phy <- as.data.frame(summary(as.factor(shared_MST_tax$Phylum)))
+shared_MST_phy$Phylum <- rownames(shared_MST_phy)
+shared_MST_phy$subset <- "MST"
+colnames(shared_MST_phy) <- c("tax_total","Phylum", "subset")
+
+#overall
+shared_all_tax <- as.data.frame(tax_table(ps3_sub))
+shared_all_phy <- as.data.frame(summary(as.factor(shared_all_tax$Phylum)))
+shared_all_phy$Phylum <- rownames(shared_all_phy)
+shared_all_phy$subset <- "Overall"
+colnames(shared_all_phy) <- c("tax_total","Phylum", "subset")
+
+#combine into 1 dataframe
+Hab_phy_comb <- rbind(Marine_unq_phy, Terr_unq_phy, Swit_unq_phy,
+                        shared_MS_phy, shared_MT_phy, shared_ST_phy,
+                        shared_MST_phy, shared_all_phy)
+
+head(Hab_phy_comb)
+
+#combine less common into 'other', using same grouping as for network plot
+group_phy #from network plot code above
+
+Hab_phy_comb$Phylum <- Hab_phy_comb$Phylum %>% 
+  fct_collapse(Other = as.list(group_phy))
+unique(Hab_phy_comb$Phylum)
+
+#Set the order of the class and subset variables for the plot
+Hab_phy_comb$Phylum <- factor(Hab_phy_comb$Phylum, 
+                               levels = c("Actinobacteria","Bacteroidetes",
+                                          "Firmicutes","Proteobacteria",  
+                                          "Other"))
+
+Hab_phy_comb$subset <- factor(Hab_phy_comb$subset, 
+                                levels = c("Marine", "Terrestrial", "Switcher",
+                                           "MS", "ST", "MT", "MST", "Overall"))
+
+#add text above the bars showing the number of ASVs per group
+# temp <- data.frame(x=c("Marine", "Terrestrial", "Switcher", 
+#                        "MS", "ST", "MT", "MST", "Overall"), 
+#                    y=c(1.02, 1.02,1.02,1.02,1.02,1.02,1.02,1.02), 
+#                    size=c("872", "233", "441", "283", "77", 
+#                           "41", "218", "2165"))
+
+#set colours using same ones as in network plot above
+#marine= #0066CC
+#switcher = #009999
+#terrest= #00CC66
+
+group.colors2 <- c(Other = "#1B9E77", Actinobacteria = "#D95F02", Bacteroidetes ="#66A61E", 
+                  Firmicutes = "#E6AB02", Proteobacteria = "#7570B3")
+
+plot8 <- ggplot(Hab_phy_comb, aes(x=subset, y=tax_total)) +
+  geom_bar(aes(fill=Phylum), position="fill", stat="identity") +
+  #geom_text(data=temp, size=6, aes(x=x, y=y, label=as.factor(size))) +
+  labs(x="Unique or shared across habitats", y="Proportion of ASVs") +
+  theme_bw() +
+  scale_x_discrete(labels=c("M", "T", "S", "SM", "ST", 
+                            "MT", "MST", "Overall")) +
+  scale_fill_manual("Phylum",values =group.colors2) +
+  theme(axis.text = element_text(size=16), axis.title = element_text(size=20),
+        legend.text = element_text(size=16),
+        legend.title = element_text(size=20))
+
+plot8
+
+#ggsave('goose_mb_hab_unq_shared_taxdistrib_Phylum_stackedbar_bootstrap17.pdf', plot8,width=15,height=10 )
+
+```
+
+
+## Plot of Beta Diversity PC1 by Time 
+
+```{r}
+
+#extract PC1 and PC2 values and add to metadata
+  PC_coords <- data.frame(goose_habitat_clr_pca$CA$u[,c(1:3)])
+  PC_coords$Sample <- rownames(PC_coords)
+  head(PC_coords)
+  
+  brent_clr_s <- merge(brent_clr_s, PC_coords, by="Sample")
+  brent_clr_s$yday<-with(brent_clr_s,strptime(date,format="%d/%m/%Y")$yday) #continuous day of year var
+
+```
+
+Want to make a 2-part plot of specialists (m+t) and switchers PC1 over time. Need to make a new variable in metadata for this (specialist/switcher).
+
+```{r}
+
+#DATA CLEANING 
+    summary(as.factor(brent_clr_s$foraging_phenotype))
+    brent_clr_s$diet_behav <- NA
+    brent_clr_s[which(brent_clr_s$foraging_phenotype%in%c("Marine", "Terrestrial")),]$diet_behav <- "Specialist"
+    brent_clr_s[which(brent_clr_s$foraging_phenotype%in%c("Switcher")),]$diet_behav <- "Switcher"
+    summary(as.factor(brent_clr_s$diet_behav))#
+    colnames(brent_clr_s)[colnames(brent_clr_s)=="habitat"] <- "Habitat"
+
+### Remove Singletons    
+    sample_tab_pc1<-table(brent_clr_s$id)
+    brent_clr_s_filter<- brent_clr_s %>% filter(id %in% names(sample_tab_pc1)[sample_tab_pc1>1])
+    
+###PLOT    
+    PC1_trajectory_plot <-
+      ggplot(subset(brent_clr_s_filter, foraging_phenotype!="NA" & PC1 !="NA"), 
+             aes(x=yday, y=PC1, fill=Habitat, group=id)) +
+      geom_line(col="grey",linewidth=1) + 
+    geom_point(shape=21, size=6,color="white")  +
+      facet_grid(~foraging_phenotype) +
+      theme_bw() +
+      theme(axis.title = element_text(size=20),
+            axis.text = element_text(size=16),
+            strip.text = element_text(size=18),
+            legend.text = element_text(size=16),
+            legend.title = element_text(size=20)) +
+      scale_fill_manual(values=c("#8DA0CB","#66C2A5")) +
+      labs(x="Day of the year",y="PC1 (13.74%)",fill="Foraging \n Habitat")
+    PC1_trajectory_plot
+
+#ggsave('Goose_PC1_trajectory_per_ind_feeding_pref_plot.pdf', PC1_trajectory_plot,width=15,height=8)
+
+```
+
+Plot each individual switcher in their own panel (only include switchers that had faecal samples taken on both marine+terrestrial; exclude 67ON, NDRB, 2TBY, U2BY)
+
+```{r}
+PC1_trajectory_plot_switchers <-
+  ggplot(subset(brent_clr_s, foraging_phenotype!="NA" & diet_behav=="Switcher" & !id%in%c("67ON", "NDRB", "T2BY", "U2BY")), 
+         aes(x=yday, y=PC1, fill=Habitat, group=id)) +
+  geom_point(shape=21, size=6) +
+  geom_line(col="grey", linewidth=6) +
+  facet_wrap(~id) +
+  theme_bw() +
+  theme(axis.title = element_text(size=20),
+        axis.text = element_text(size=16),
+        strip.text = element_text(size=18),
+        legend.text = element_text(size=16),
+        legend.title = element_text(size=20)) +
+  scale_fill_manual(values=c("#8DA0CB","#66C2A5")) +
+  xlab("Day of the year") + ylab("PC1 (13.74%)")
+PC1_trajectory_plot_switchers
+
+#ggsave('Goose_PC1_trajectory_per_ind_switcher.jpeg', PC1_trajectory_plot_switchers,width=15,height=8)
+```
+
+##Within-individual variability per foraging phenotype
+
+Let's look at individual microbiome stability across foraging groups, using distances to individual centroids in PCA space.
+
+```{r warning=FALSE}
+
+dist <- distance(brent_clr, method = "euclidean", type = "samples") #euclidean distance matrix
+meta <- as(sample_data(brent_clr), 'data.frame')
+#?betadisper #more info on how the tests work
+beta <- betadisper(dist, meta$id) #replace XXX with variable of interest 
+permutest(beta)
+
+#beta$distances #distances of samples to their group centroids
+#beta$centroids #centroids of individuals in PCA space
+
+boxplot(beta) #has some individuals that were only sampled once
+plot(beta) #visualises group centroids in ordination space
+
+```
+Check individual-level dispersion among switchers/specialists i.e. distances to individual centroids - hypothesis is that switcher microbiomes are more variable over time within an individual than microbiomes of specialists
+
+```{r}
+
+dist.to.ind.centroids <- as.data.frame(beta$distances)
+dist.to.ind.centroids <- cbind(dist.to.ind.centroids, rownames(dist.to.ind.centroids))
+names(dist.to.ind.centroids) <- c("Dist.to.ind.centroid", "Sample")
+meta <- merge(meta, dist.to.ind.centroids, by="Sample")
+meta$foraging_phenotype <- as.factor(meta$foraging_phenotype)
+#write.csv(meta, "Goose_microbiome_dist_to_centroids_May17.csv")
+head(meta)
+
+ggplot(meta, aes(x=foraging_phenotype, y=Dist.to.ind.centroid)) +
+  geom_violin()
+
+hist(meta$Dist.to.ind.centroid)
+
+library(lme4)
+
+m1 <- lme(Dist.to.ind.centroid ~ foraging_phenotype, 
+          random=~1|id, 
+          data=meta)
+
+plot(m1)
+anova(m1)
+summary(m1)
+drop1(m1, test="Chisq")
+
+meta$foraging_phenotype <- relevel(meta$foraging_phenotype,ref="Switcher")
+m2 <- lme(Dist.to.ind.centroid ~ foraging_phenotype, 
+          random=~1|id, 
+          data=meta)
+summary(m2)
+
+```
+So distances to individual centroids (i.e. within-individual variance) is significantly lower in terrestrial vs marine (p=0.0027) and switchers (p=0.0054), but not different between switcher and marine (p=0.4119) --> terrestrial geese have less variable mcirobiomes over time.
+
+plot predictions from the model
+
+```{r}
+
+library(ggeffects)
+pred <- ggeffect(m1, terms = "foraging_phenotype")
+pred
+plot(pred)
+names(meta)
+names(pred)
+names(pred) <- c("foraging_phenotype", "Dist.to.ind.centroid", "std.error", "conf.low", "conf.high", "group")
+
+dist_plot <- ggplot(meta, aes(x=factor(foraging_phenotype, levels = c("Marine", "Switcher", "Terrestrial")), y=Dist.to.ind.centroid,
+                              group=foraging_phenotype, 
+                              colour=foraging_phenotype)) +
+  geom_point(size=6, shape=21,  
+             aes(fill=foraging_phenotype, alpha=1.5)) +
+  geom_errorbar(data=pred, aes(ymin = conf.low, ymax = conf.high), 
+                width=0, colour="black", size=1.2) +
+  geom_point(data=pred, size=8, shape=21,
+             fill="white", colour="black") +
+  theme_bw() +
+  xlab("Foraging Phenotype") + 
+  ylab("Distance to individual centroids")  +
+  scale_fill_manual(values = c("#FC8D62","#8DA0CB" ,"#66C2A5" )) +
+  scale_colour_manual(values = c("#FC8D62", "#8DA0CB","#66C2A5" )) +
+  theme(legend.position = "none", axis.title = element_text(size=20),
+          axis.text = element_text(size=16))
+dist_plot
+
+#ggsave('goose_mb_dist_to_ind_centroids_boxplot.pdf', dist_plot,width=8,height=8 ) 
+```
+
+
+## Model of PC1 Trajectory Over Time 
+
+```{r}
+# # Scale Day 
+#   brent_clr_s_filter$z_day<- as.numeric(scale(brent_clr_s_filter$yday))
+# 
+# #MODEL
+#   pc1_mod1<-brm(PC1 ~ foraging_phenotype * z_day + (1|id),data=brent_clr_s_filter,family=gaussian())
+#     summary(pc1_mod1)
+#     conditional_effects(pc1_mod1)
+#     
+# #Model Checking
+#     pp_check(pc1_mod1)
+#     bayes_R2(pc1_mod1)
+# 
+
+```
+
+## Combined Temporal Dynamics Plot 
+
+```{r}
+
+alpha_time_inext_plot2 <- alpha_time_inext_plot2 + 
+                            theme(axis.title.x = element_blank(),
+                            legend.position = "top",
+                            legend.text = element_text(size=10),
+                            legend.title = element_text(size=12)) 
+PC1_trajectory_plot <- PC1_trajectory_plot + 
+                            theme(legend.position = "none") +
+    facet_grid(~factor(foraging_phenotype, levels=c('Terrestrial',
+                                                    'Switcher',
+                                                    'Marine')))
+
+traj_plot<-plot_grid(alpha_time_inext_plot2,PC1_trajectory_plot,nrow=2,labels="AUTO",label_size = 30)
+traj_plot 
+#ggsave2('Figure 2 Temporal Dynamics Plot.pdf',width=25,height=18,units="cm")
+#ggsave2('Figure 2 Temporal Dynamics Plot.jpeg',width=25,height=18,units="cm")
+```
+
+# API Trajectory Over Time
+```{r}
+## Data 
+mayresight5_join$yday<-with(mayresight5_join,strptime(Date,format="%d/%m/%Y")$yday)
+mayresight5_join$z_yday<-as.numeric(scale(mayresight5_join$yday))
+
+##Plot
+    api_plot1 <- ggplot(mayresight5_join, aes(x = as.numeric(z_yday), y = as.numeric(API), fill = foraging_phenotype)) + geom_jitter(size=6,shape=21,color="white") +
+      theme(axis.text=element_text(size = 10), axis.title=element_text(size = 12)) +
+      labs(x = "Standardised Day", y = "Abdominal Profile Index (API)") 
+    api_plot2<-api_plot1 + geom_smooth(method = "lm",formula = "y~poly(x,3)",size=2,se=F,aes(color=foraging_phenotype)) + theme_bw() + theme(legend.text.align = -1,legend.position="bottom",legend.text=element_text(size=17),legend.title=element_text(size=17),axis.text=element_text(size=20),axis.title=element_text(size=20)) + labs(color="")
+    api_plot3<- api_plot2 + scale_fill_manual(values=forage_cols,breaks=c("Terrestrial","Marine","Switcher")) +  scale_color_manual(values=forage_cols,breaks=c("Terrestrial","Marine","Switcher")) + guides(fill="none")
+api_plot3
+    
+#ggsave('Figure 4 Goose API Trajectory.pdf', api_plot3,width=26,height=18,units="cm")
+```
+
+## API MODELS
+
+```{r}
+####API models and Plots####
+#names(mayresight5_join)  
+#names(goose)
+
+goose_sex <- goose[,c(3,4)]
+names(goose_sex) <- c("Bird", "Sex")
+head(goose_sex)
+goose_sex2 <- goose_sex[duplicated(goose_sex)==F, ]
+
+mayresight5_join2 <- merge(mayresight5_join, goose_sex2, all.x = T, by="Bird")
+#names(mayresight5_join2)
+
+```
+
+```{r}
+#MODEL
+# #install.packages("MuMIn")
+# library(lmerTest)
+# library(lme4)
+# summary(mayresight5_join2)
+
+#Subset to Complete Data
+  mayresight5_join3 <- subset(mayresight5_join2, !is.na(API) & !is.na(z_yday) & !is.na(foraging_phenotype) & !is.na(Sex) & !is.na(Bird))
+
+
+#Model - 3rd Order Polynomial
+  API_poly3 <- brm(API ~ poly(z_yday,3) * foraging_phenotype+  Sex +  (1|Bird), data = mayresight5_join3) #full 
+  summary(API_poly3)
+      #Check
+        pp_check(API_poly3)
+        bayes_R2(API_poly3)
+      #Predictions  
+        conditional_effects(API_poly3)
+        
+#Model - 2rd Order Polynomial
+  APIlm_poly2 <- brm(API ~ poly(z_yday,2) * foraging_phenotype + Sex + (1|Bird), data = mayresight5_join3) #full 
+  summary(APIlm_poly2)
+    #Check
+        pp_check(APIlm_poly2)
+        bayes_R2(APIlm_poly2)
+    #Predictions  
+        conditional_effects(APIlm_poly2)
+
+ 
+######## MODEL SELECTION
+  APIlm <- lmer(API ~ poly(z_yday,3) * foraging_phenotype+  Sex +  (1|Bird), data = mayresight5_join3) #full 
+
+    library(MuMIn)
+    options(na.action = "na.fail")
+    
+    dredge(APIlm, REML = F, subset = dc(z_yday, {I(z_yday^2)}) && dc({foraging_phenotype:z_yday}, {foraging_phenotype:I(z_yday^2)}))
+    
+  #need to relevel the factors
+    mayresight5_join3$foraging_phenotype <- factor(mayresight5_join3$foraging_phenotype, levels = c("Terrestrial", "Switcher", "Marine"))
+    APIlmB <- lmer(as.numeric(API) ~ z_yday * foraging_phenotype + I(z_yday^2) + Sex + (1|Bird), data = mayresight5_join3,
+                  na.action = na.omit, REML = F) #best model
+    summary(APIlmB)
+    anova(APIlmB)
+    print(APIlmB)
+
+##Average API for each foraging phenotype
+
+avAPI1 <- subset(mayresight5_join3, foraging_phenotype=="Terrestrial")
+mean(avAPI1$API)
+avAPI2 <- subset(mayresight5_join3, foraging_phenotype=="Marine")
+mean(avAPI2$API)
+avAPI3 <- subset(mayresight5_join3, foraging_phenotype=="Switcher")
+mean(avAPI3$API)
+
+```
+
+
+####EXTRA API MODELLING CODE####
+
+**ALSO A BIT BROKEN**
+```
+brent_clr2 <- brent_clean2
+            colnames(sample_data(brent_clr2)) [5] <- "ID"
+            
+            brent_clr2_data <- as.data.frame(sample_data(brent_clr2))
+            
+            brent_clr2_data <- left_join(brent_clr2_data, foraging_phenotype, by = "ID")
+            
+            sample_data(brent_clr2)$FeederType <- brent_clr2_data$FeederType
+            sample_data(brent_clr2) <- sample_data(brent_clr2)[complete.cases(sample_data(brent_clr2)$foraging_phenotype),]
+            
+            sample_data(brent_clr2) <- sample_data(brent_clr2) na.action = na.omit$foraging_phenotype)]
+            brent_clr2 <- microbiome::transform(brent_clr2, "clr")
+            
+            brent_clr_v2<-vegan_otu(brent_clr2)
+            brent_clr_s2<-as(sample_data(brent_clr2),"data.frame")     
+            
+            
+            bcs <- brent_clr_s2
+            
+bcs$foraging_phenotype <- ifelse(bcs$foraging_phenotype == "Marine First", "Switcher", ifelse(bcs$foraging_phenotype == "Terrestrial First", "Switcher", bcs$foraging_phenotype))
+            
+            
+            bps<-adonis2(brent_clr_v2 ~ foraging_phenotype, data=bcs, nperm=999, method="euclidean") #PERMANOVA
+            bps
+            cite(adonis)
+      # Try pairwise test?
+            install.packages('devtools')
+            library(devtools)
+            install_github("pmartinezarbizu/pairwiseAdonis/pairwiseAdonis")
+            library(pairwiseAdonis)
+            
+            pairwise.adonis2(brent_clr_v2 ~ feedertype, data=bcs, nperm=999, method="euclidean")
+            
+            bpc <- brent_pc_scores_sub
+            bpc <- bpc[bpc$sampletype=="faeces",]
+            colnames(bpc) [7] <- "ID"
+            bpc <- left_join(bpc, feedertype, by = "ID")
+            bpc$FeederType <- ifelse(bpc$FeederType == "Marine First", "Switcher",
+                                        ifelse(bpc$FeederType == "Terrestrial First", 
+                                              "Switcher", bpc$FeederType))
+            bpc <- bpc[complete.cases(bpc$FeederType),]
+            
+            
+           # write.csv(mayresight5_join3,"C:/Users/ij235/OneDrive - University of Exeter/Goose_microbiome_MS/Goose_microbiome_analyses\\mayresight5_join3.csv",row.names = FALSE)
+```
+
+
+**BROKEN & MISSING FILE**
+```
+####INDICATOR ANALYSIS####
+
+#Read in Habitat Classifications
+
+    goosedf2<-read.csv('goosedf2.csv',header=T)
+
+head(goosedf2)
+
+any(is.na(goosedf2$FeederType))
+
+#Subset  non-rarefied brent data down to only Individuals that have feeder type data
+
+brent_clean_feeder_subset<-subset_samples(brent_clean2,id %in% goosedf2$ID)
+
+nrow(goosedf2)
+
+##Rarefy
+
+brent_clean_feeder_subset_rare<-rarefy_even_depth(brent_clean_feeder_subset,rngseed=17072020)
+
+
+#Strip Out Matrix of ASV abundance
+
+brent_clean_feeder_subset_asv<-vegan_otu(brent_clean_feeder_subset_rare)
+
+dim(brent_clean_feeder_subset_asv)
+
+# #Any ASVs all 0s?
+
+#   brent_clean_feeder_subset_asv_nozero<-brent_clean_feeder_subset_asv[,apply(brent_clean_feeder_subset_asv,2,function(x)sum(x)>0)]
+
+#   dim(brent_clean_feeder_subset_asv)
+
+#   dim(brent_clean_feeder_subset_asv_nozero)
+
+#Geese to Match to Feeder Tyoe
+
+geese_names_indval<-rownames(brent_clean_feeder_subset_asv)
+
+
+#Lookup Dataframe for CLuster membership
+
+cluster_lookup<-data.frame(feeder=unique(goosedf2$FeederType),cluster=seq(3))
+
+
+#Make A vector of cluster membership
+
+goose_clusters<-cluster_lookup$cluster[match(as.character(goosedf2$FeederType[match(geese_names_indval,goosedf2$SampleID)]),cluster_lookup$feeder)]
+
+### Perform Indicator Analysis
+install.packages("labdsv")
+library(labdsv)
+
+goose_indicator<-indval(brent_clean_feeder_subset_asv,goose_clusters)
+
+summary(goose_indicator)
+
+####### Stringent Subsetting to Sig Indicators
+
+#Extract The Full Dataframe
+
+goose_indic_output<-data.frame(indval=goose_indicator$indcls,pval=goose_indicator$pval,cluster=goose_indicator$maxcls)
+
+#Add in The Taxon Labels as a column
+
+#R adds an annoying 'X' to the leading edge of hexadecimal IDs that start with numbers, so we need to strip those out using 'gsub'
+
+goose_indic_output$taxon<-rownames(goose_indic_output)
+
+#Subset to Indicator Values >0.5
+
+goose_indic_significant<-subset(goose_indic_output,indval>=0.4 & pval <=0.05)
+
+head(goose_indic_significant)         
+          
+#Annotate With Taxonomy
+#Subset to Most 50 abundant OTUs
+            brent_clean_rare2 <- brent_clean_rare
+            ps_rare_top50 <- prune_taxa(names(sort(taxa_sums(brent_clean_rare2),TRUE)[1:50]), brent_clean_rare2)
+            
+            brent_clean_rare2@otu_table <- brent_clean_rare2@otu_table[,-c(1, 2, 146:153)]
+ps_rare_tax <- data.frame(tax_table(ps_rare_top50))
+
+ps_rare_tax$taxon<-rownames(ps_rare_tax)
+
+goose_indic_significant<-left_join(goose_indic_significant,ps_rare_tax,"taxon")
+
+head(goose_indic_significant)
+
+```
+
+
